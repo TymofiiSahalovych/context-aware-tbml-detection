@@ -6,10 +6,11 @@ process (commodity, route, volume, season, noise). Over-/under-invoicing is then
 into a random subset of test flows. Methods are compared on how well they rank / flag the
 injected flows. Results show detection capability under the simulation assumptions only.
 
-Requires: numpy, pandas, scikit-learn, matplotlib.
-Run:  python tbml_sim.py
 """
+import argparse
 import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor, IsolationForest
@@ -83,21 +84,25 @@ def robust_scale(resid, comm):
     return np.maximum(s.values, 1e-3)
 
 
-def run(seed, drop_dist=False, train_contam=0.01):
+def run(seed, drop_dist=False, train_contam=0.01, n_train=N_TRAIN, n_cal=N_CAL, n_test=N_TEST):
     rng = np.random.default_rng(seed)
     w = make_world(rng)
-    train = inject(rng, make_flows(rng, w, N_TRAIN), train_contam, [0.1, 0.25, 0.5, 1.0])  # unlabeled contamination
-    cal = inject(rng, make_flows(rng, w, N_CAL), train_contam, [0.1, 0.25, 0.5, 1.0])
-    test_base = make_flows(rng, w, N_TEST)
+    train = inject(rng, make_flows(rng, w, n_train), train_contam, [0.1, 0.25, 0.5, 1.0])  # unlabeled contamination
+    cal = inject(rng, make_flows(rng, w, n_cal), train_contam, [0.1, 0.25, 0.5, 1.0])
+    test_base = make_flows(rng, w, n_test)
 
     feats_num = ["lv", "month"] + ([] if drop_dist else ["dist_obs"])
     feats_cat = ["comm", "orig", "dest"]
 
     # B1: conventional price filter around the commodity-wide average (no context)
     med = train.groupby("comm").logp.median()
+    global_med = train.logp.median()
     mean_price = train.assign(p=np.exp(train.logp)).groupby("comm").p.mean()
+    global_mean_price = np.exp(train.logp).mean()
+    def commodity_median(df):
+        return med.reindex(df.comm).fillna(global_med).values
     def b1_score(df):                      # fixed-band logic expressed as a ranking score
-        return np.abs(df.logp.values - med.reindex(df.comm).values)
+        return np.abs(df.logp.values - commodity_median(df))
     mad = robust_scale(train.logp.values - med.reindex(train.comm).values, train.comm.values)
     def b1z_score(df):                     # per-commodity robust z-score
         return b1_score(df) / mad[df.comm.values]
@@ -117,7 +122,7 @@ def run(seed, drop_dist=False, train_contam=0.01):
 
     # U: Isolation Forest on commodity-relative price + volume + freight proxy (no price target)
     def if_X(df):
-        X = np.c_[df.logp.values - med.reindex(df.comm).values, df.lv.values]
+        X = np.c_[df.logp.values - commodity_median(df), df.lv.values]
         return X if drop_dist else np.c_[X, df.dist_obs.values]
     iso = IsolationForest(n_estimators=200, random_state=seed).fit(if_X(train))
 
@@ -132,7 +137,7 @@ def run(seed, drop_dist=False, train_contam=0.01):
         "M gradient boosting": lambda d: np.abs(d.logp.values - gbt.predict(d[cols])) / s_gbt[d.comm.values],
         "U isolation forest": lambda d: -iso.score_samples(if_X(d)),
     }
-    thr = {k: np.quantile(f(cal), 1 - ALPHA) for k, f in scorers.items()}   # conformal-style calibration
+    thr = {k: np.quantile(f(cal), 1 - ALPHA) for k, f in scorers.items()}
 
     rows = []
     for m in MAGNITUDES:
@@ -148,7 +153,8 @@ def run(seed, drop_dist=False, train_contam=0.01):
                              recall_het=flag[(y == 1) & test.het.values].mean(),
                              recall_std=flag[(y == 1) & ~test.het.values].mean()))
         # the conventional fixed +-50 % rule around the commodity mean price
-        p, ref = np.exp(test.logp.values), mean_price.reindex(test.comm).values
+        p = np.exp(test.logp.values)
+        ref = mean_price.reindex(test.comm).fillna(global_mean_price).values
         flag = np.abs(p / ref - 1) > 0.5
         rows.append(dict(seed=seed, magnitude=m, method="R50 fixed +-50% rule", ap=np.nan,
                          recall=flag[y == 1].mean(), fpr=flag[y == 0].mean(),
@@ -158,18 +164,68 @@ def run(seed, drop_dist=False, train_contam=0.01):
     return rows
 
 
-def summarise(rows):
-    df = pd.DataFrame(rows)
-    g = df.groupby(["magnitude", "method"]).agg(["mean", "std"])
-    return df, g
+def main():
+    parser = argparse.ArgumentParser(description="Run the synthetic TBML price-anomaly experiment.")
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run a smaller, single-seed check and write separately named smoke outputs.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("."),
+        help="Directory for generated CSV and JSON results (default: current directory).",
+    )
+    args = parser.parse_args()
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.smoke:
+        scenarios = {"main": {}}
+        seeds = 1
+        run_options = {"n_train": 3000, "n_cal": 1000, "n_test": 2000}
+        filename_prefix = "results_smoke_"
+        summary_filename = "results_smoke_summary.json"
+    else:
+        scenarios = {
+            "main": {},
+            "no_freight_proxy": {"drop_dist": True},
+            "contam5": {"train_contam": 0.05},
+        }
+        seeds = N_SEEDS
+        run_options = {}
+        filename_prefix = "results_"
+        summary_filename = "results_summary.json"
+
+    out = {}
+    for name, kw in scenarios.items():
+        rows = [
+            r
+            for s in range(seeds)
+            for r in run(s, **kw, **run_options)
+        ]
+        df = pd.DataFrame(rows)
+        df.to_csv(args.output_dir / f"{filename_prefix}{name}.csv", index=False)
+
+        metrics = ["ap", "recall", "fpr", "precision", "recall_het", "recall_std"]
+        grouped = df.groupby(["magnitude", "method"])[metrics].agg(["mean", "std"])
+        summary = []
+        for (magnitude, method), values in grouped.iterrows():
+            record = {"magnitude": float(magnitude), "method": method}
+            for metric in metrics:
+                for statistic in ("mean", "std"):
+                    value = values[(metric, statistic)]
+                    record[f"{metric}_{statistic}"] = (
+                        round(float(value), 3) if pd.notna(value) else None
+                    )
+            summary.append(record)
+        out[name] = summary
+        print(name, "done")
+
+    with (args.output_dir / summary_filename).open("w", encoding="utf-8") as summary_file:
+        json.dump(out, summary_file, indent=2, allow_nan=False)
+        summary_file.write("\n")
 
 
 if __name__ == "__main__":
-    out = {}
-    for name, kw in {"main": {}, "no_freight_proxy": {"drop_dist": True}, "contam5": {"train_contam": 0.05}}.items():
-        rows = [r for s in range(N_SEEDS) for r in run(s, **kw)]
-        df, _ = summarise(rows)
-        df.to_csv(f"results_{name}.csv", index=False)
-        out[name] = df.groupby(["magnitude", "method"])[["ap", "recall", "fpr", "precision", "recall_het", "recall_std"]].mean().round(3).reset_index().to_dict("records")
-        print(name, "done")
-    json.dump(out, open("results_summary.json", "w"))
+    main()
