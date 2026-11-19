@@ -30,7 +30,7 @@ For 25% injected price distortion, averaged over 10 seeds in `results_main.csv`:
 
 Average precision is useful at the simulated 1% anomaly prevalence, but absolute detection remains limited: most alerts are still false positives. Results describe only this simulation and its assumptions.
 
-The full run writes one per-seed CSV for each scenario and `results_summary.json`, which contains means and sample standard deviations across seeds. Undefined AP values (for the fixed-rule method) are represented as JSON `null`.
+The full run writes one per-seed CSV and one four-panel PNG plot for each scenario, plus `results_summary.json`, which contains means and sample standard deviations across seeds. Undefined AP values (for the fixed-rule method) are represented as JSON `null`. The PNG plots show average precision, recall, false-positive rate, and precision by injected distortion magnitude, with error bars showing seed variation.
 
 ## Limitations
 

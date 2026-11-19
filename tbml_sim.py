@@ -17,6 +17,9 @@ from sklearn.ensemble import HistGradientBoostingRegressor, IsolationForest
 from sklearn.linear_model import Ridge
 from sklearn.metrics import average_precision_score
 from sklearn.preprocessing import OneHotEncoder
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 ALPHA = 0.02            # alert budget: share of legitimate flows allowed to be flagged
 PREVALENCE = 0.01       # share of test flows with injected distortion
@@ -24,6 +27,53 @@ MAGNITUDES = [0.0, 0.10, 0.25, 0.50, 1.00]   # 0.0 = correctly priced laundering
 N_COMM, N_ORIG, N_DEST = 30, 15, 15
 N_TRAIN, N_CAL, N_TEST = 30000, 10000, 20000
 N_SEEDS = 10
+
+
+def plot_scenario(df, scenario_name, output_dir, filename_prefix):
+    """Write a compact four-panel plot of the main detection metrics."""
+    metrics = [
+        ("ap", "Average precision"),
+        ("recall", "Recall"),
+        ("fpr", "False-positive rate"),
+        ("precision", "Precision"),
+    ]
+    methods = list(dict.fromkeys(df["method"]))
+    colors = plt.colormaps["tab10"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"TBML simulation: {scenario_name}", fontsize=14)
+
+    for ax, (metric, title) in zip(axes.flat, metrics):
+        for i, method in enumerate(methods):
+            data = df[df["method"] == method].groupby("magnitude")[metric].agg(["mean", "std"])
+            data = data.reindex(sorted(df["magnitude"].unique()))
+            ax.errorbar(
+                data.index,
+                data["mean"],
+                yerr=data["std"].fillna(0),
+                marker="o",
+                linewidth=1.8,
+                capsize=3,
+                label=method,
+                color=colors(i % 10),
+            )
+        ax.set_title(title)
+        ax.set_ylabel("Score")
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.25)
+        if metric == "fpr":
+            ax.axhline(ALPHA, linestyle="--", linewidth=1, color="black",
+                       label=f"Nominal alert target ({ALPHA:.0%})")
+
+    for ax in axes[1]:
+        ax.set_xlabel("Injected distortion magnitude")
+    axes[0, 0].legend(fontsize=8, ncol=2)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    plot_path = output_dir / f"{filename_prefix}{scenario_name}_metrics.png"
+    fig.savefig(plot_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print("plot", plot_path)
 
 
 # ----------------------------------------------------------------------------- data
@@ -206,6 +256,7 @@ def main():
         ]
         df = pd.DataFrame(rows)
         df.to_csv(args.output_dir / f"{filename_prefix}{name}.csv", index=False)
+        plot_scenario(df, name, args.output_dir, filename_prefix)
 
         metrics = ["ap", "recall", "fpr", "precision", "recall_het", "recall_std"]
         grouped = df.groupby(["magnitude", "method"])[metrics].agg(["mean", "std"])
